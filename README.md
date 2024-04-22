@@ -6,17 +6,22 @@ Large language models (LLMs) like GPT4, Claude 3, and Llama2 generate new tokens
 
 Our project focuses combining quantizing LLM weights with more efficient KV-cache strategies to maximize the performance of larger models on a consumer device such as a consumer-grade GPU.
 
-# Tasks to do by Friday:
+# Tasks to do by Tuesday 4/23:
 
 Commit current code
 
-Ask on Piazza how much code from a paper we are using can be re-used
-- Boilerplate code for testing should be kept I hope?
-- We will be reimplementing the algorithms (e.g. heavy hitter cache algorithm, storing weight error, most of GEAR itself)
+Implement Heavy-Hitter Algorithm using transformers?
+- Consider implementing this from scratch OR from GEAR
+- Heavy Hitter Oracle github uses PyTorch and HuggingFace Transformers
+- We can use PyTorch and Transformers from scratch, consider putting this somewhere in GEAR?
+- Use GEAR and integrate H2O into GEAR itself (instead of LRU)
 
-Implement Heavy-Hitter Algorithm
+Modify this: 
+https://github.com/opengear-project/GEAR/blob/4ca6495740fef09d360fa1f0bd97f6d04680bcee/TrueCompressionLlaMA/old_models/modeling_llama_old.py 
 
-Implement the core contents of GEAR on our own
+Start some writeup/presentation
+
+Implement SIEVE version of Llama2
 
 Profile Llama2-7B on a laptop
-- Raghav
+- Raghav did this, 5 tokens/second for 4 bit quantization
