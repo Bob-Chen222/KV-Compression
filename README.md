@@ -6,18 +6,57 @@ Large language models (LLMs) like GPT4, Claude 3, and Llama2 generate new tokens
 
 Our project focuses combining quantizing LLM weights with more efficient KV-cache strategies to maximize the performance of larger models on a consumer device such as a consumer-grade GPU.
 
-# Tasks to do by Tuesday 4/23:
+# Our Compression Approach
+
+We plan on combining GEAR with Heavy Hitter Oracle
+
+GEAR: KV cache compression framework
+- Uniform Quantization for most entries
+- Low-rank matrix to approximate quantization residuals
+- Sparse matrix to remedy individual errors from outliers
+- Small token buffer of size N exists, compress cache every N steps
+
+Heavy Hitter Oracle: Improved KV cache algorithm for evicting tokens
+- Want a cache that's small, has low miss rates (the elements we want), and cheap eviction
+- Attention matrices are sparse
+- Heavy Hitters: Small set of influential tokens we need that can be found greedily
+
+Heavy Hitter Oracle:
+- Remove elements in cache with worst score f
+- f can be attention algorithm
+
+TL DR; Use GEAR's KV cache compression + Heavy Hitter Oracle to handle KV cache eviction
+
+# Testing Suite
+
+Run Llama2-7B
+- GSM8k (math suite)
+- MMLU (knowledge/reasoning suite)
+- BBH (language + reasoning)
+
+Use chain of thought reasoning on each
+- Compare FP16 baseline, uniform quant, group quant from GEAR
+
+Things we will run:
+- Heavy Hitters only
+- GEAR + H2O
+
+Performance Analysis on Llama2-7B
+- Weights + KV cache size
+- Peak memory consumption
+Compare for:
+- Model size, KV cache, GEAR size, GEAR + H2O
+
+# Tasks to do by 4/24:
 
 Commit current code
 
-Implement Heavy-Hitter Algorithm using transformers?
-- Consider implementing this from scratch OR from GEAR
-- Heavy Hitter Oracle github uses PyTorch and HuggingFace Transformers
-- We can use PyTorch and Transformers from scratch, consider putting this somewhere in GEAR?
-- Use GEAR and integrate H2O into GEAR itself (instead of LRU)
+Make sure Heavy Hitter Oracle works
+- Aryan, Bob
 
-Modify this: 
-https://github.com/opengear-project/GEAR/blob/4ca6495740fef09d360fa1f0bd97f6d04680bcee/TrueCompressionLlaMA/old_models/modeling_llama_old.py 
+Start GEAR
+- Raghav initially, then everyone
+
 
 Start some writeup/presentation
 
