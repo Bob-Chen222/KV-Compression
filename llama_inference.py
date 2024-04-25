@@ -8,6 +8,7 @@ import copy
 from typing import Optional, Tuple
 from transformers.cache_utils import Cache
 from transformers.models.llama.modeling_llama import LlamaSdpaAttention, apply_rotary_pos_emb, repeat_kv
+import lm_eval
 print("Done with imports")
 
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -97,8 +98,6 @@ class LlamaAttentionHHOracle(LlamaSdpaAttention):
 
         # create overall weights mask
         keep_weights = is_heavy
-        if passes % 16 == 0:
-            print("Proportion of weights kept:", keep_weights.to(torch.float16).mean())
         
         # make the weights we don't want to keep small before we softmax
         attn_weights[~keep_weights] = torch.finfo(attn_weights.dtype).min
@@ -279,15 +278,16 @@ if __name__ == "__main__":
     # replace the attention layers
     layers = model._modules['model']._modules['layers']._modules
     num_layers = len(layers)
-    start_replacement = 16
+    start_replacement = 32
     heavy_hitters_prop = 0.1
     recent_prop = 0.05
     minimum_tokens = 10
-    for i in range(start_replacement, num_layers): 
+    for i in range(16): 
         attn_layer = layers[f"{i}"]._modules['self_attn']
         layers[f"{i}"]._modules['self_attn'] = \
-            LlamaAttentionHHGreedy(attn_layer, heavy_hitters_prop=heavy_hitters_prop, 
-                recent_prop=recent_prop, minimum_tokens=minimum_tokens).to(DEVICE)
+            LlamaAttentionHHOracle(attn_layer, heavy_hitters_prop=heavy_hitters_prop).to(DEVICE)
+            # LlamaAttentionHHGreedy(attn_layer, heavy_hitters_prop=heavy_hitters_prop, 
+                # recent_prop=recent_prop, minimum_tokens=minimum_tokens).to(DEVICE)
         print(f"replaced layer {i}")
 
     input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
@@ -295,6 +295,18 @@ if __name__ == "__main__":
     # reload the attention weights
     model.load_state_dict(checkpoint)
 
-    outputs = model.generate(input_ids, do_sample=False, max_length=4000)
-    print(tokenizer.batch_decode(outputs, skip_special_tokens=True)[0])
+    lm_obj = lm_eval.models.huggingface.HFLM(pretrained=model, tokenizer=tokenizer, batch_size=16)
+    task_manager = lm_eval.tasks.TaskManager()
+    
+    tasks = ["openbookqa"]
+    metrics = ["acc_norm,none"]
+    results = lm_eval.simple_evaluate(
+        model = lm_obj, 
+        tasks = tasks,
+        num_fewshot = 0,
+        task_manager=task_manager
+    )
+    for task, metric in zip(tasks, metrics):
+        print(task, results['results'][task][metric])
+
 
