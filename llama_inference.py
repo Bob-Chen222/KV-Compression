@@ -96,8 +96,14 @@ class LlamaAttentionHHOracle(LlamaSdpaAttention):
         is_heavy = is_heavy.scatter(-1, topk, True).unsqueeze(2) # (1, nh, 1, nk)
         is_heavy = is_heavy.expand(is_heavy.shape[0], is_heavy.shape[1], attn_weights.shape[2], is_heavy.shape[3]) # (1, nh, nq, nk)
 
+        # create recency mask
+        num_rec = max(self.minimum_tokens, math.floor(num_keys * self.recent_prop))
+        is_recent = torch.ones_like(attn_weights, dtype=torch.bool)
+        is_recent = torch.tril(is_recent, diagonal=num_rec)
+        is_recent = torch.triu(is_recent, diagonal=0)
+
         # create overall weights mask
-        keep_weights = is_heavy
+        keep_weights = torch.logical_or(is_recent, is_heavy)
         
         # make the weights we don't want to keep small before we softmax
         attn_weights[~keep_weights] = torch.finfo(attn_weights.dtype).min
@@ -278,16 +284,12 @@ if __name__ == "__main__":
     # replace the attention layers
     layers = model._modules['model']._modules['layers']._modules
     num_layers = len(layers)
-    start_replacement = 32
-    heavy_hitters_prop = 0.1
-    recent_prop = 0.05
-    minimum_tokens = 10
-    for i in range(16): 
+    heavy_hitters_prop = 0.2
+    recent_prop = 0.1
+    for i in range(3, 32, 4): 
         attn_layer = layers[f"{i}"]._modules['self_attn']
         layers[f"{i}"]._modules['self_attn'] = \
-            LlamaAttentionHHOracle(attn_layer, heavy_hitters_prop=heavy_hitters_prop).to(DEVICE)
-            # LlamaAttentionHHGreedy(attn_layer, heavy_hitters_prop=heavy_hitters_prop, 
-                # recent_prop=recent_prop, minimum_tokens=minimum_tokens).to(DEVICE)
+            LlamaAttentionHHOracle(attn_layer, heavy_hitters_prop=heavy_hitters_prop, recent_prop=recent_prop).to(DEVICE)
         print(f"replaced layer {i}")
 
     input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
@@ -298,8 +300,8 @@ if __name__ == "__main__":
     lm_obj = lm_eval.models.huggingface.HFLM(pretrained=model, tokenizer=tokenizer, batch_size=16)
     task_manager = lm_eval.tasks.TaskManager()
     
-    tasks = ["openbookqa"]
-    metrics = ["acc_norm,none"]
+    tasks = ["openbookqa"] #["openbookqa", "copa", "piqa"]
+    metrics =  ["acc_norm,none"] #["acc_norm,none", "acc,none", "acc,none"]
     results = lm_eval.simple_evaluate(
         model = lm_obj, 
         tasks = tasks,
@@ -308,5 +310,4 @@ if __name__ == "__main__":
     )
     for task, metric in zip(tasks, metrics):
         print(task, results['results'][task][metric])
-
 
