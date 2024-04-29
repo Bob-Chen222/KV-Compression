@@ -149,6 +149,7 @@ class LlamaAttentionHHGreedy(LlamaSdpaAttention):
         self.accum_sum_scores = None # (1, nh, nk)
         self.evicted = None          # (1, nh, nk)
         self.num_evicted = 0
+        self.last_num_keys = None
 
     def forward(
         self,
@@ -203,6 +204,18 @@ class LlamaAttentionHHGreedy(LlamaSdpaAttention):
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        
+        num_keys = attn_weights.shape[-1]
+        num_queries = attn_weights.shape[-2]
+        if self.last_num_keys is None or self.last_num_keys + num_queries != num_keys: # new sample, reset cache
+            # print(f"Last numkeys {self.last_num_keys}, num queries {num_queries}, numkeys {num_keys}. Resetting cache")
+            self.last_num_keys = num_keys 
+            self.accum_sum_scores = None # (1, nh, nk)
+            self.evicted = None          # (1, nh, nk)
+            self.num_evicted = 0
+        else:
+            self.last_num_keys = num_keys
+
         if self.evicted is not None: # don't regard weights corresponding to keys that have already been evicted
             for q in range(attn_weights.shape[-2]):
                 attn_weights[:, :, q, :self.evicted.shape[-1]][self.evicted] = torch.finfo(attn_weights.dtype).min
@@ -271,7 +284,7 @@ if __name__ == "__main__":
     print(f"Running on device {DEVICE}")
 
     model_name = "meta-llama/Llama-2-7b-chat-hf"
-    prompt = "Write an essay concerning the pros and cons of attending Harvard Business School.\n"
+    prompt = "Generate 10 questions about cellular biology.\n"
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     print("Loaded tokenizer")
@@ -284,30 +297,32 @@ if __name__ == "__main__":
     # replace the attention layers
     layers = model._modules['model']._modules['layers']._modules
     num_layers = len(layers)
-    heavy_hitters_prop = 0.2
+    heavy_hitters_prop = 0.5
     recent_prop = 0.1
-    for i in range(3, 32, 4): 
+    for i in range(16, 32): 
         attn_layer = layers[f"{i}"]._modules['self_attn']
         layers[f"{i}"]._modules['self_attn'] = \
-            LlamaAttentionHHOracle(attn_layer, heavy_hitters_prop=heavy_hitters_prop, recent_prop=recent_prop).to(DEVICE)
+            LlamaAttentionHHGreedy(attn_layer, heavy_hitters_prop=heavy_hitters_prop, recent_prop=recent_prop).to(DEVICE)
         print(f"replaced layer {i}")
-
-    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
 
     # reload the attention weights
     model.load_state_dict(checkpoint)
 
-    lm_obj = lm_eval.models.huggingface.HFLM(pretrained=model, tokenizer=tokenizer, batch_size=16)
-    task_manager = lm_eval.tasks.TaskManager()
+    # lm_obj = lm_eval.models.huggingface.HFLM(pretrained=model, tokenizer=tokenizer, batch_size=16)
+    # task_manager = lm_eval.tasks.TaskManager()
     
-    tasks = ["openbookqa"] #["openbookqa", "copa", "piqa"]
-    metrics =  ["acc_norm,none"] #["acc_norm,none", "acc,none", "acc,none"]
-    results = lm_eval.simple_evaluate(
-        model = lm_obj, 
-        tasks = tasks,
-        num_fewshot = 0,
-        task_manager=task_manager
-    )
-    for task, metric in zip(tasks, metrics):
-        print(task, results['results'][task][metric])
+    # tasks = ["piqa"] #["openbookqa", "copa", "piqa"]
+    # metrics =  ["acc,none"] #["acc_norm,none", "acc,none", "acc,none"]
+    # results = lm_eval.simple_evaluate(
+    #     model = lm_obj, 
+    #     tasks = tasks,
+    #     num_fewshot = 0,
+    #     task_manager=task_manager
+    # )
+    # for task, metric in zip(tasks, metrics):
+    #     print(task, results['results'][task][metric])
+    
+    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
+    outputs = model.generate(input_ids, do_sample=False, max_length=2000)
+    print(tokenizer.batch_decode(outputs, skip_special_tokens=True))
 
