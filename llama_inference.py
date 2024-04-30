@@ -10,12 +10,15 @@ from typing import Optional, Tuple
 from transformers.cache_utils import Cache
 from transformers.models.llama.modeling_llama import LlamaSdpaAttention, apply_rotary_pos_emb, repeat_kv
 import lm_eval
+import gc
 print("Done with imports")
 
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float16
 passes = 0
 total_time = 0
+key_approx_error = 0
+value_approx_error = 0
 
 class LlamaAttentionHHOracle(LlamaSdpaAttention):
     def __init__(self, regular_attn: LlamaSdpaAttention, heavy_hitters_prop=0.2, recent_prop=0.2, minimum_tokens=None):
@@ -92,7 +95,7 @@ class LlamaAttentionHHOracle(LlamaSdpaAttention):
         num_keys = sum_scores.shape[-1]
 
         # create heavy hitter mask
-        num_hh = max(self.minimum_tokens, math.floor(num_keys * self.heavy_hitters_prop))
+        num_hh = math.floor(num_keys * self.heavy_hitters_prop)
         _, topk = sum_scores.topk(k=num_hh, dim=-1)
         is_heavy = torch.zeros_like(sum_scores, dtype=torch.bool) # (1, nh, nk)
         is_heavy = is_heavy.scatter(-1, topk, True).unsqueeze(2) # (1, nh, 1, nk)
@@ -297,16 +300,17 @@ def GEARApprox(to_approx: torch.Tensor, outlier_prop: float, rank: int, quant_di
     filtered[is_outlier] = 0
     maxf, minf = filtered.max(), filtered.min()
     delta = (maxf - minf) / quant_div
-    quantf = (filtered - minf) / delta
+    quantf = ((filtered - minf) / delta).round()
     approx = quantf * delta + minf
-    u, s, v = torch.svd_lowrank(to_approx, q=rank, M=approx)
-    lowrank_error = torch.matmul(torch.matmul(u, torch.diag_embed(s)), v.transpose(2, 3))
-    approx += lowrank_error
-    approx[is_outlier] = to_approx[is_outlier]
+    if rank > 0:
+        u, s, v = torch.svd_lowrank(to_approx, q=rank, M=approx)
+        lowrank_error = torch.matmul(torch.matmul(u, torch.diag_embed(s)), v.transpose(2, 3))
+        approx += lowrank_error
+    approx = torch.where(is_outlier, to_approx, approx)
     return approx.to(torch.float16)
 
 class LlamaAttentionGEAR(LlamaSdpaAttention):
-    def __init__(self, regular_attn: LlamaSdpaAttention, outlier_prop=0.05, rank=1, buffer_size=20, minimum_tokens=None):
+    def __init__(self, regular_attn: LlamaSdpaAttention, outlier_prop=0.01, num_bits_quant=4, key_rank=1, value_rank=1, buffer_size=20, minimum_tokens=None):
         super().__init__(regular_attn.config, regular_attn.layer_idx)
         self.q_proj = self.q_proj.to(DTYPE)
         self.k_proj = self.k_proj.to(DTYPE)
@@ -314,14 +318,15 @@ class LlamaAttentionGEAR(LlamaSdpaAttention):
         self.o_proj = self.o_proj.to(DTYPE)
         self.training = False
         self.outlier_prop = outlier_prop
-        self.rank = rank
+        self.key_rank = key_rank
+        self.value_rank = value_rank
         self.buffer_size = buffer_size
         self.key_approx = None
         self.value_approx = None
         self.key_buffer = None
         self.value_buffer = None
         self.last_num_keys = None
-        self.num_bits_quant = 4
+        self.num_bits_quant = num_bits_quant
         self.quant_div = (1 << self.num_bits_quant) - 1
 
     def forward(
@@ -338,6 +343,8 @@ class LlamaAttentionGEAR(LlamaSdpaAttention):
         bsz, q_len, _ = hidden_states.size()
         global passes
         global total_time
+        global key_approx_error
+        global value_approx_error
 
 
         if self.config.pretraining_tp > 1:
@@ -405,14 +412,13 @@ class LlamaAttentionGEAR(LlamaSdpaAttention):
             self.value_buffer = torch.concat((self.value_buffer, value_states), dim=2)
 
         # rip self.buffer_size vectors from buffer and approximate them
-        time_start = time.time()
         while self.key_buffer is not None and self.key_buffer.shape[2] >= self.buffer_size:
             to_approx = self.key_buffer[:, :, :self.buffer_size, :]
             if self.key_buffer.shape[2] == self.buffer_size:
                 self.key_buffer = None
             else:
                 self.key_buffer = self.key_buffer[:, :, self.buffer_size:, :]
-            approx_keys = GEARApprox(to_approx, self.outlier_prop, self.rank, self.quant_div)
+            approx_keys = GEARApprox(to_approx, self.outlier_prop, self.key_rank, self.quant_div)
             if self.key_approx is None:
                 self.key_approx = approx_keys
             else:
@@ -423,12 +429,11 @@ class LlamaAttentionGEAR(LlamaSdpaAttention):
                 self.value_buffer = None
             else:
                 self.value_buffer = self.value_buffer[:, :, self.buffer_size:, :]
-            approx_values = GEARApprox(to_approx, self.outlier_prop, self.rank, self.quant_div)
+            approx_values = GEARApprox(to_approx, self.outlier_prop, self.value_rank, self.quant_div)
             if self.value_approx is None:
                 self.value_approx = approx_values
             else:
                 self.value_approx = torch.concat((self.value_approx, approx_values), dim=2)
-        total_time += time.time() - time_start
 
         keys_now = self.key_buffer if self.key_approx is None \
                     else (self.key_approx if self.key_buffer is None \
@@ -436,9 +441,8 @@ class LlamaAttentionGEAR(LlamaSdpaAttention):
         values_now = self.value_buffer if self.value_approx is None \
                     else (self.value_approx if self.value_buffer is None \
                     else torch.concat((self.value_approx, self.value_buffer), dim=2))
-        if passes % 1024 == 0:
-            print("Key approximation error:", (keys_now - orig_key_states).norm() / orig_key_states.norm())
-            print("Value approximation error:", (values_now - orig_value_states).norm() / orig_value_states.norm())
+        key_approx_error += (keys_now - orig_key_states).norm() / orig_key_states.norm()
+        value_approx_error += (values_now - orig_value_states).norm() / orig_value_states.norm()
         attn_weights = torch.matmul(query_states, keys_now.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         # upcast attention to fp32
@@ -467,9 +471,6 @@ class LlamaAttentionGEAR(LlamaSdpaAttention):
             attn_scores = None
         
         passes += 1
-        if passes % 1024 == 0:
-            print(f"Time info: {passes} passes, {total_time / passes} seconds per pass")
-
 
         return attn_output, attn_scores, past_key_value
 
@@ -481,6 +482,7 @@ if __name__ == "__main__":
 
     model_name = "meta-llama/Llama-2-7b-chat-hf"
     prompt = "Generate 10 questions about cellular biology.\n"
+    load_path = "/ocean/projects/cis240042p/asoman/.cache/huggingface/hub/models--meta-llama--Llama-2-7b-chat-hf"
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     print("Loaded tokenizer")
@@ -493,34 +495,40 @@ if __name__ == "__main__":
     # replace the attention layers
     layers = model._modules['model']._modules['layers']._modules
     num_layers = len(layers)
-    heavy_hitters_prop = 0.5
-    recent_prop = 0.1
-    for i in range(16, 32): 
+    rank = 0
+    num_layers_replaced = 8
+    for i in range(num_layers - num_layers_replaced, num_layers): 
         attn_layer = layers[f"{i}"]._modules['self_attn']
-        # layers[f"{i}"]._modules['self_attn'] = \
-            # LlamaAttentionHHGreedy(attn_layer, heavy_hitters_prop=heavy_hitters_prop, recent_prop=recent_prop).to(DEVICE)
         layers[f"{i}"]._modules['self_attn'] = \
-            LlamaAttentionGEAR(attn_layer).to(DEVICE) # heavy_hitters_prop=heavy_hitters_prop, recent_prop=recent_prop).to(DEVICE)
+            LlamaAttentionHHOracle(attn_layer, heavy_hitters_prop=0, recent_prop=0.9).to(DEVICE) 
+        # layers[f"{i}"]._modules['self_attn'] = \
+        #     LlamaAttentionGEAR(attn_layer, outlier_prop=0.025, num_bits_quant=2, key_rank=rank, value_rank=rank).to(DEVICE) 
         print(f"replaced layer {i}")
 
     # reload the attention weights
+    # state_dict = torch.load(load_path)
     model.load_state_dict(checkpoint)
+    del checkpoint
+    gc.collect()
 
-    # lm_obj = lm_eval.models.huggingface.HFLM(pretrained=model, tokenizer=tokenizer, batch_size=16)
-    # task_manager = lm_eval.tasks.TaskManager()
+    lm_obj = lm_eval.models.huggingface.HFLM(pretrained=model, tokenizer=tokenizer, batch_size=16)
+    task_manager = lm_eval.tasks.TaskManager()
     
-    # tasks = ["piqa"] #["openbookqa", "copa", "piqa"]
-    # metrics =  ["acc,none"] #["acc_norm,none", "acc,none", "acc,none"]
-    # results = lm_eval.simple_evaluate(
-    #     model = lm_obj, 
-    #     tasks = tasks,
-    #     num_fewshot = 0,
-    #     task_manager=task_manager
-    # )
-    # for task, metric in zip(tasks, metrics):
-    #     print(task, results['results'][task][metric])
+    tasks = ["openbookqa", "copa", "piqa"]
+    metrics = ["acc_norm,none", "acc,none", "acc,none"]
+    with torch.no_grad():
+        results = lm_eval.simple_evaluate(
+            model = lm_obj, 
+            tasks = tasks,
+            num_fewshot = 0,
+            task_manager=task_manager
+        )
+    for task, metric in zip(tasks, metrics):
+        print(task, results['results'][task][metric])
+    # print(f"Key approximation error for GEAR: {key_approx_error/passes}")
+    # print(f"Value approximation error for GEAR: {value_approx_error/passes}")
     
-    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
-    outputs = model.generate(input_ids, do_sample=False, max_length=2000)
-    print(tokenizer.batch_decode(outputs, skip_special_tokens=True)[0])
+    # input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
+    # outputs = model.generate(input_ids, do_sample=False, max_length=2000)
+    # print(tokenizer.batch_decode(outputs, skip_special_tokens=True)[0])
 
