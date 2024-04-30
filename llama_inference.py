@@ -480,7 +480,21 @@ if __name__ == "__main__":
     print(f"Running on device {DEVICE}")
 
     model_name = "meta-llama/Llama-2-7b-chat-hf"
-    prompt = "Generate 10 questions about cellular biology.\n"
+    prompts = ["Generate 10 questions about cellular biology.\n", 
+               "You are interviewing a candidate for a compilers software engineering role. Give ten questions related to LLVM and MLIR along with answers\n", 
+               "How does SSA in LLVM IR work? Specifically, what is SSA and how do phi nodes work in LLVM IR?\n", 
+               "What is register allocation?  Describe an register allocation algorithm\n",
+               "Describe simplicial elimination ordering and maximal cardinality search for register allocation\n",
+               "Explain five types of general compiler optimizations.\n",
+               "Describe 10 MLIR dialects.\n",
+               "Compare Paxos and Raft.\n",
+               "Describe the Chubby in the context of distributed systems\n",
+               "You are a staff software engineer at a large tech company.  Develop ten difficult system design questions to ask senior SWE candidates.  Include answers for each question and include what you expect from successful candidates\n",
+               "You are a teaching assistant for an undergraduate computer architecture course.  Explain memory consistency models to a student.  Cover weak memory consistency, total store order, and strict consistency.  Give an example where total store order behaves differently than strict consistency\n",
+               "Describe NVIDIA's programming model for their GPUs\n",
+               "In NVIDIA's CUDA programming model, what is a warp? How does it relate to streaming multiprocessors?\n",
+               "You are a senior software engineer at a large tech company such as Microsoft or Google.  You are interviewing a new graduate from CMU for a software engineering role.  Give five behavioral questions to this new graduate.  Give good answers to these questions from this new graduate.\n",
+               "You are a senior staff software engineer interviewing at a large tech company for a principal engineering position on a team that is developing a new vector database. Describe the internals of a vector database.\n"] 
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     print("Loaded tokenizer")
@@ -520,7 +534,8 @@ if __name__ == "__main__":
     # for task, metric in zip(tasks, metrics):
     #     print(task, results['results'][task][metric])
     
-    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
-    outputs = model.generate(input_ids, do_sample=False, max_length=2000)
-    print(tokenizer.batch_decode(outputs, skip_special_tokens=True)[0])
+    for prompt in prompts:
+        input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
+        outputs = model.generate(input_ids, do_sample=False, max_length=2000)
+        print(tokenizer.batch_decode(outputs, skip_special_tokens=True)[0])
 
